@@ -27,6 +27,7 @@
  * Included Files
  ****************************************************************************/
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef CONFIG_DRIVERS_VIRTIO_MMIO
@@ -68,6 +69,42 @@ int virtio_register_mmio_device(FAR void *regs, int irq);
 
 #ifdef CONFIG_ARCH_TRUSTZONE_SECURE
 int virtio_register_mmio_device_secure(FAR void *regs, int irq);
+#endif
+
+/****************************************************************************
+ * Name: virtio_mmio_pool_create
+ *
+ * Description:
+ *   Create a pool from the memory region a virtio mmio device is restricted
+ *   to, e.g. the only one a hypervisor shares with the virtual machine that
+ *   implements the device. The address and the size of the region must be
+ *   multiples of CONFIG_DRIVERS_VIRTIO_MMIO_POOL_BLOCKSIZE.
+ *
+ * Returned Value:
+ *   The pool, to be passed to virtio_register_mmio_device_pool() for each
+ *   device that shares the region, or NULL on failure.
+ *
+ ****************************************************************************/
+
+#ifdef CONFIG_DRIVERS_VIRTIO_MMIO_POOL
+struct virtio_mmio_pool_s;
+
+FAR struct virtio_mmio_pool_s *virtio_mmio_pool_create(FAR void *base,
+                                                       size_t size);
+
+/****************************************************************************
+ * Name: virtio_register_mmio_device_pool
+ *
+ * Description:
+ *   Register to the virtio bus a virtio mmio device that can only access
+ *   the memory of a pool. Its virtqueues and the buffers its driver
+ *   allocates come from the pool, and the other buffers the driver hands
+ *   to the device are bounced through it.
+ *
+ ****************************************************************************/
+
+int virtio_register_mmio_device_pool(FAR void *regs, int irq,
+                                     FAR struct virtio_mmio_pool_s *pool);
 #endif
 
 #ifdef __cplusplus

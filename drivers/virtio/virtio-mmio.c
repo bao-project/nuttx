@@ -31,8 +31,14 @@
 #include <stdint.h>
 #include <sys/param.h>
 
+#include <stdbool.h>
+#include <string.h>
+
 #include <nuttx/arch.h>
+#include <nuttx/kmalloc.h>
 #include <nuttx/mm/kasan.h>
+#include <nuttx/nuttx.h>
+#include <nuttx/spinlock.h>
 #include <nuttx/virtio/virtio.h>
 #include <nuttx/virtio/virtio-mmio.h>
 
@@ -45,6 +51,16 @@
 #define VIRTIO_VRING_ALIGN              VIRTIO_PAGE_SIZE
 
 #define VIRTIO_MMIO_VERSION_1           1
+
+/* Blocks of the memory pool of a device that cannot access all memory */
+
+#ifdef CONFIG_DRIVERS_VIRTIO_MMIO_POOL
+#  define POOL_BLOCKSIZE                CONFIG_DRIVERS_VIRTIO_MMIO_POOL_BLOCKSIZE
+#  define POOL_NBLOCKS(size)            (((size) + POOL_BLOCKSIZE - 1) / \
+                                         POOL_BLOCKSIZE)
+#  define POOL_BLOCK_FREE               0
+#  define POOL_BLOCK_CONT               UINT32_MAX
+#endif
 
 /* Control registers */
 
@@ -176,6 +192,8 @@
  * Private Types
  ****************************************************************************/
 
+struct virtio_mmio_pool_s;
+
 struct virtio_mmio_device_s
 {
   struct virtio_device   vdev;       /* Virtio device */
@@ -188,7 +206,31 @@ struct virtio_mmio_device_s
   metal_phys_addr_t      shm_phy;    /* Share memory physical address */
   metal_phys_addr_t      cfg_phy;    /* Config memory physical address */
   int                    irq;        /* The mmio interrupt number */
+#ifdef CONFIG_DRIVERS_VIRTIO_MMIO_POOL
+  FAR struct virtio_mmio_pool_s *pool; /* Memory the device can access, NULL
+                                        * if it can access all of it
+                                        */
+#endif
 };
+
+#ifdef CONFIG_DRIVERS_VIRTIO_MMIO_POOL
+
+/* A pool of memory shared with the device, managed as an array of blocks
+ * of CONFIG_DRIVERS_VIRTIO_MMIO_POOL_BLOCKSIZE bytes. The state of the
+ * blocks is kept out of the pool, where the device cannot reach it.
+ */
+
+struct virtio_mmio_pool_s
+{
+  uintptr_t     base;                /* Address of the first block */
+  size_t        nblocks;             /* Number of blocks */
+  spinlock_t    lock;                /* Protects the block states */
+  FAR uint32_t *blocks;              /* State of each block: free, the
+                                      * number of blocks of the allocation
+                                      * it starts, or part of one
+                                      */
+};
+#endif
 
 /****************************************************************************
  * Private Function Prototypes
@@ -206,6 +248,21 @@ static void virtio_mmio_free_buf(FAR struct virtio_device *vdev,
                                  FAR void *buf);
 static int virtio_mmio_init_device(FAR struct virtio_mmio_device_s *vmdev,
                                    FAR void *regs, int irq);
+
+#ifdef CONFIG_DRIVERS_VIRTIO_MMIO_POOL
+static FAR void *virtio_mmio_pool_alloc_buf(FAR struct virtio_device *vdev,
+                                            size_t size, size_t align);
+static void virtio_mmio_pool_free_buf(FAR struct virtio_device *vdev,
+                                      FAR void *buf);
+static size_t virtio_mmio_pool_free_largest(FAR struct virtio_device *vdev);
+static FAR void *virtio_mmio_pool_map(FAR struct virtio_device *vdev,
+                                      FAR void *buf, size_t len,
+                                      enum virtio_dma_map dir);
+static void virtio_mmio_pool_unmap(FAR struct virtio_device *vdev,
+                                   FAR void *buf, size_t len,
+                                   enum virtio_dma_map dir,
+                                   FAR void *mapped);
+#endif
 
 /* Virtio mmio dispatch functions */
 
@@ -280,6 +337,23 @@ static const struct virtio_memory_ops g_virtio_mmio_mmops =
   .unmap        = NULL,
 #endif
 };
+
+#ifdef CONFIG_DRIVERS_VIRTIO_MMIO_POOL
+
+/* The device can only access the pool: the virtqueues and the buffers the
+ * drivers allocate come from it, and the other buffers are bounced through
+ * it.
+ */
+
+static const struct virtio_memory_ops g_virtio_mmio_pool_mmops =
+{
+  .alloc        = virtio_mmio_pool_alloc_buf,
+  .free         = virtio_mmio_pool_free_buf,
+  .free_largest = virtio_mmio_pool_free_largest,
+  .map          = virtio_mmio_pool_map,
+  .unmap        = virtio_mmio_pool_unmap,
+};
+#endif
 
 /****************************************************************************
  * Private Functions
@@ -818,6 +892,221 @@ static void virtio_mmio_free_buf(FAR struct virtio_device *vdev,
   kmm_free(buf);
 }
 
+#ifdef CONFIG_DRIVERS_VIRTIO_MMIO_POOL
+
+/****************************************************************************
+ * Name: virtio_mmio_pool_alloc
+ *
+ * Description:
+ *   Allocate size bytes aligned to align, a power of two, from the pool.
+ *   This may be called from an interrupt handler.
+ *
+ ****************************************************************************/
+
+static FAR void *virtio_mmio_pool_alloc(FAR struct virtio_mmio_pool_s *pool,
+                                        size_t size, size_t align)
+{
+  size_t nblocks = POOL_NBLOCKS(MAX(size, 1));
+  size_t step = 1;
+  size_t first = 0;
+  FAR void *buf = NULL;
+  irqstate_t flags;
+  size_t i;
+  size_t n;
+
+  DEBUGASSERT(align == 0 || (align & (align - 1)) == 0);
+
+  /* The blocks are aligned to their size: a larger alignment restricts the
+   * blocks the allocation may start at.
+   */
+
+  if (align > POOL_BLOCKSIZE)
+    {
+      step  = align / POOL_BLOCKSIZE;
+      first = (ALIGN_UP(pool->base, align) - pool->base) / POOL_BLOCKSIZE;
+    }
+
+  flags = spin_lock_irqsave(&pool->lock);
+
+  for (i = first; i < pool->nblocks && nblocks <= pool->nblocks - i;
+       i += step)
+    {
+      for (n = 0; n < nblocks && pool->blocks[i + n] == POOL_BLOCK_FREE;
+           n++)
+        {
+        }
+
+      if (n == nblocks)
+        {
+          pool->blocks[i] = nblocks;
+          for (n = 1; n < nblocks; n++)
+            {
+              pool->blocks[i + n] = POOL_BLOCK_CONT;
+            }
+
+          buf = (FAR void *)(pool->base + i * POOL_BLOCKSIZE);
+          break;
+        }
+    }
+
+  spin_unlock_irqrestore(&pool->lock, flags);
+  return buf;
+}
+
+/****************************************************************************
+ * Name: virtio_mmio_pool_free
+ *
+ * Description:
+ *   Return a buffer to the pool, or only tell its size if release is false.
+ *   The size is zero if buf is not the address of an allocation.
+ *
+ ****************************************************************************/
+
+static size_t virtio_mmio_pool_free(FAR struct virtio_mmio_pool_s *pool,
+                                    FAR void *buf, bool release)
+{
+  uintptr_t offset = (uintptr_t)buf - pool->base;
+  size_t i = offset / POOL_BLOCKSIZE;
+  size_t nblocks = 0;
+  irqstate_t flags;
+  size_t n;
+
+  flags = spin_lock_irqsave(&pool->lock);
+
+  if ((uintptr_t)buf >= pool->base && i < pool->nblocks &&
+      offset % POOL_BLOCKSIZE == 0 &&
+      pool->blocks[i] != POOL_BLOCK_FREE &&
+      pool->blocks[i] != POOL_BLOCK_CONT)
+    {
+      nblocks = pool->blocks[i];
+      for (n = 0; release && n < nblocks; n++)
+        {
+          pool->blocks[i + n] = POOL_BLOCK_FREE;
+        }
+    }
+
+  spin_unlock_irqrestore(&pool->lock, flags);
+
+  DEBUGASSERT(nblocks != 0);
+  return nblocks * POOL_BLOCKSIZE;
+}
+
+/****************************************************************************
+ * Name: virtio_mmio_pool_alloc_buf
+ ****************************************************************************/
+
+static FAR void *virtio_mmio_pool_alloc_buf(FAR struct virtio_device *vdev,
+                                            size_t size, size_t align)
+{
+  FAR struct virtio_mmio_device_s *vmdev =
+    (FAR struct virtio_mmio_device_s *)vdev;
+
+  return virtio_mmio_pool_alloc(vmdev->pool, size, align);
+}
+
+/****************************************************************************
+ * Name: virtio_mmio_pool_free_buf
+ ****************************************************************************/
+
+static void virtio_mmio_pool_free_buf(FAR struct virtio_device *vdev,
+                                      FAR void *buf)
+{
+  FAR struct virtio_mmio_device_s *vmdev =
+    (FAR struct virtio_mmio_device_s *)vdev;
+
+  virtio_mmio_pool_free(vmdev->pool, buf, true);
+}
+
+/****************************************************************************
+ * Name: virtio_mmio_pool_free_largest
+ *
+ * Description:
+ *   Return the size of the largest buffer the pool can provide right now.
+ *
+ ****************************************************************************/
+
+static size_t virtio_mmio_pool_free_largest(FAR struct virtio_device *vdev)
+{
+  FAR struct virtio_mmio_device_s *vmdev =
+    (FAR struct virtio_mmio_device_s *)vdev;
+  FAR struct virtio_mmio_pool_s *pool = vmdev->pool;
+  size_t largest = 0;
+  size_t n = 0;
+  irqstate_t flags;
+  size_t i;
+
+  flags = spin_lock_irqsave(&pool->lock);
+
+  for (i = 0; i < pool->nblocks; i++)
+    {
+      n = pool->blocks[i] == POOL_BLOCK_FREE ? n + 1 : 0;
+      largest = MAX(largest, n);
+    }
+
+  spin_unlock_irqrestore(&pool->lock, flags);
+  return largest * POOL_BLOCKSIZE;
+}
+
+/****************************************************************************
+ * Name: virtio_mmio_pool_map
+ *
+ * Description:
+ *   Make a buffer the device cannot access available to it: allocate a
+ *   bounce buffer from the pool and, unless the device only writes to it,
+ *   copy the data there.
+ *
+ ****************************************************************************/
+
+static FAR void *virtio_mmio_pool_map(FAR struct virtio_device *vdev,
+                                      FAR void *buf, size_t len,
+                                      enum virtio_dma_map dir)
+{
+  FAR struct virtio_mmio_device_s *vmdev =
+    (FAR struct virtio_mmio_device_s *)vdev;
+  FAR void *bounce;
+
+  bounce = virtio_mmio_pool_alloc(vmdev->pool, len, 0);
+  if (bounce != NULL && dir != VIRTIO_DMA_FROM_DEVICE)
+    {
+      memcpy(bounce, buf, len);
+    }
+
+  return bounce;
+}
+
+/****************************************************************************
+ * Name: virtio_mmio_pool_unmap
+ *
+ * Description:
+ *   Release the bounce buffer of a mapped buffer. Unless the device only
+ *   read it, copy to the buffer the len bytes the device has written, which
+ *   may be less than what was mapped.
+ *
+ ****************************************************************************/
+
+static void virtio_mmio_pool_unmap(FAR struct virtio_device *vdev,
+                                   FAR void *buf, size_t len,
+                                   enum virtio_dma_map dir,
+                                   FAR void *mapped)
+{
+  FAR struct virtio_mmio_device_s *vmdev =
+    (FAR struct virtio_mmio_device_s *)vdev;
+
+  if (mapped == NULL)
+    {
+      return;
+    }
+
+  if (dir != VIRTIO_DMA_TO_DEVICE)
+    {
+      memcpy(buf, mapped,
+             MIN(len, virtio_mmio_pool_free(vmdev->pool, mapped, false)));
+    }
+
+  virtio_mmio_pool_free(vmdev->pool, mapped, true);
+}
+#endif /* CONFIG_DRIVERS_VIRTIO_MMIO_POOL */
+
 /****************************************************************************
  * Name: virtio_mmio_init_device
  ****************************************************************************/
@@ -848,6 +1137,12 @@ static int virtio_mmio_init_device(FAR struct virtio_mmio_device_s *vmdev,
   vdev->role = VIRTIO_DEV_DRIVER;
   vdev->func = &g_virtio_mmio_dispatch;
   vdev->mmops = &g_virtio_mmio_mmops;
+#ifdef CONFIG_DRIVERS_VIRTIO_MMIO_POOL
+  if (vmdev->pool != NULL)
+    {
+      vdev->mmops = &g_virtio_mmio_pool_mmops;
+    }
+#endif
 
   magic = metal_io_read32(&vmdev->cfg_io, VIRTIO_MMIO_MAGIC_VALUE);
   if (magic != VIRTIO_MMIO_MAGIC_VALUE_STRING)
@@ -905,7 +1200,9 @@ static int virtio_mmio_init_device(FAR struct virtio_mmio_device_s *vmdev,
  *
  ****************************************************************************/
 
-static int virtio_register_mmio_device_(FAR void *regs, int irq, bool secure)
+static int
+virtio_register_mmio_device_(FAR void *regs, int irq, bool secure,
+                             FAR struct virtio_mmio_pool_s *pool)
 {
   FAR struct virtio_mmio_device_s *vmdev;
   int ret;
@@ -918,6 +1215,12 @@ static int virtio_register_mmio_device_(FAR void *regs, int irq, bool secure)
       vrterr("No enough memory\n");
       return -ENOMEM;
     }
+
+#ifdef CONFIG_DRIVERS_VIRTIO_MMIO_POOL
+  vmdev->pool = pool;
+#else
+  UNUSED(pool);
+#endif
 
   ret = virtio_mmio_init_device(vmdev, regs, irq);
   if (ret == -ENODEV)
@@ -980,7 +1283,7 @@ err:
 
 int virtio_register_mmio_device(FAR void *regs, int irq)
 {
-  return virtio_register_mmio_device_(regs, irq, false);
+  return virtio_register_mmio_device_(regs, irq, false, NULL);
 }
 
 /****************************************************************************
@@ -994,6 +1297,73 @@ int virtio_register_mmio_device(FAR void *regs, int irq)
 #ifdef CONFIG_ARCH_TRUSTZONE_SECURE
 int virtio_register_mmio_device_secure(FAR void *regs, int irq)
 {
-  return virtio_register_mmio_device_(regs, irq, true);
+  return virtio_register_mmio_device_(regs, irq, true, NULL);
+}
+#endif
+
+#ifdef CONFIG_DRIVERS_VIRTIO_MMIO_POOL
+
+/****************************************************************************
+ * Name: virtio_mmio_pool_create
+ *
+ * Description:
+ *   Create a pool from the memory region a virtio mmio device is restricted
+ *   to, e.g. the only one a hypervisor shares with the virtual machine that
+ *   implements the device. The address and the size of the region must be
+ *   multiples of CONFIG_DRIVERS_VIRTIO_MMIO_POOL_BLOCKSIZE.
+ *
+ * Returned Value:
+ *   The pool, to be passed to virtio_register_mmio_device_pool() for each
+ *   device that shares the region, or NULL on failure.
+ *
+ ****************************************************************************/
+
+FAR struct virtio_mmio_pool_s *virtio_mmio_pool_create(FAR void *base,
+                                                       size_t size)
+{
+  FAR struct virtio_mmio_pool_s *pool;
+
+  if (base == NULL || size < POOL_BLOCKSIZE ||
+      (uintptr_t)base % POOL_BLOCKSIZE != 0 || size % POOL_BLOCKSIZE != 0)
+    {
+      vrterr("Bad pool region %p, size %zu\n", base, size);
+      return NULL;
+    }
+
+  pool = kmm_zalloc(sizeof(*pool));
+  if (pool == NULL)
+    {
+      return NULL;
+    }
+
+  pool->base    = (uintptr_t)base;
+  pool->nblocks = size / POOL_BLOCKSIZE;
+  pool->blocks  = kmm_zalloc(pool->nblocks * sizeof(pool->blocks[0]));
+  if (pool->blocks == NULL)
+    {
+      kmm_free(pool);
+      return NULL;
+    }
+
+  spin_lock_init(&pool->lock);
+  return pool;
+}
+
+/****************************************************************************
+ * Name: virtio_register_mmio_device_pool
+ *
+ * Description:
+ *   Register to the virtio bus a virtio mmio device that can only access
+ *   the memory of a pool. Its virtqueues and the buffers its driver
+ *   allocates come from the pool, and the other buffers the driver hands
+ *   to the device are bounced through it.
+ *
+ ****************************************************************************/
+
+int virtio_register_mmio_device_pool(FAR void *regs, int irq,
+                                     FAR struct virtio_mmio_pool_s *pool)
+{
+  DEBUGASSERT(pool != NULL);
+  return virtio_register_mmio_device_(regs, irq, false, pool);
 }
 #endif
