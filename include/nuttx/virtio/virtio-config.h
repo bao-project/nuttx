@@ -37,6 +37,7 @@
 /* Virtio common feature bits */
 
 #define VIRTIO_F_ANY_LAYOUT   27
+#define VIRTIO_F_VERSION_1    32
 
 /* Virtio helper functions */
 
