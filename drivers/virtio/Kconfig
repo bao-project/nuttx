@@ -34,6 +34,28 @@ config DRIVERS_VIRTIO_MMIO
 	default n
 	select DRIVERS_VIRTIO
 
+config DRIVERS_VIRTIO_MMIO_POOL
+	bool "Virtio MMIO restricted memory pool"
+	default n
+	depends on DRIVERS_VIRTIO_MMIO
+	---help---
+		Support virtio mmio devices that can only access a given memory
+		region instead of all the memory, e.g. devices implemented by
+		another virtual machine of a static partitioning hypervisor, which
+		only shares that region. Such a device is registered with
+		virtio_register_mmio_device_pool(). Its virtqueues and the buffers
+		its driver allocates are taken from the region, and the other
+		buffers the driver hands to the device are bounced through it.
+
+config DRIVERS_VIRTIO_MMIO_POOL_BLOCKSIZE
+	int "Virtio MMIO restricted memory pool block size"
+	default 64
+	range 16 4096
+	depends on DRIVERS_VIRTIO_MMIO_POOL
+	---help---
+		The pool is allocated in blocks of this size, a power of two. Every
+		allocation and bounce buffer takes a whole number of blocks.
+
 config DRIVERS_VIRTIO_MMIO_QUEUE_LEN
 	int "Virtio MMIO Virtio Queue Length"
 	default 0
