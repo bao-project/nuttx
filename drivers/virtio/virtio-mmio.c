@@ -46,6 +46,10 @@
 
 #define VIRTIO_MMIO_VERSION_1           1
 
+/* Feature bit a driver of a non legacy device has to accept */
+
+#define VIRTIO_MMIO_F_VERSION_1         (UINT64_C(1) << 32)
+
 /* Control registers */
 
 /* Magic value ("virt" string) - Read Only */
@@ -543,6 +547,14 @@ static void virtio_mmio_set_status(FAR struct virtio_device *vdev,
 {
   FAR struct virtio_mmio_device_s *vmdev =
     (FAR struct virtio_mmio_device_s *)vdev;
+
+  /* Status bits are cumulative, only a reset clears them */
+
+  if (status != VIRTIO_CONFIG_STATUS_RESET)
+    {
+      status |= metal_io_read32(&vmdev->cfg_io, VIRTIO_MMIO_STATUS);
+    }
+
   metal_io_write32(&vmdev->cfg_io, VIRTIO_MMIO_STATUS, status);
 }
 
@@ -691,6 +703,13 @@ static void virtio_mmio_set_features(FAR struct virtio_device *vdev,
 {
   FAR struct virtio_mmio_device_s *vmdev =
     (FAR struct virtio_mmio_device_s *)vdev;
+
+  /* Non legacy devices require VIRTIO_F_VERSION_1 */
+
+  if (vdev->id.version != VIRTIO_MMIO_VERSION_1)
+    {
+      features |= VIRTIO_MMIO_F_VERSION_1;
+    }
 
   metal_io_write32(&vmdev->cfg_io, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0);
   metal_io_write32(&vmdev->cfg_io, VIRTIO_MMIO_DRIVER_FEATURES, features);
