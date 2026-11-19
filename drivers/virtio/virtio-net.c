@@ -114,6 +114,17 @@ begin_packed_struct struct virtio_net_config_s
   uint32_t supported_hash_types;
 } end_packed_struct;
 
+/* A netpkt in a virtqueue, with the addresses the device accesses each of
+ * its buffers at, see virtio_map_buf().
+ */
+
+struct virtio_net_buf_s
+{
+  FAR struct virtio_net_buf_s *flink;
+  FAR netpkt_t                *pkt;
+  FAR void                    *map[VIRTIO_NET_MAX_NIOB];
+};
+
 struct virtio_net_priv_s
 {
 #ifdef CONFIG_DRIVERS_WIFI_SIM
@@ -134,6 +145,11 @@ struct virtio_net_priv_s
   FAR struct virtio_device *vdev;      /* Virtio device pointer */
   int                       bufnum;    /* TX and RX Buffer number */
   size_t                    hdrsize;   /* Virtio net header size */
+
+  /* The buffers of each virtqueue that are not in use */
+
+  FAR struct virtio_net_buf_s *bufs;
+  FAR struct virtio_net_buf_s *freebufs[VIRTIO_NET_NUM];
 };
 
 /* The virtio net header is placed right before the ETH header, follow shows
@@ -147,7 +163,7 @@ struct virtio_net_priv_s
  * ^base           ^data
  *
  * The virtio net header takes the last priv->hdrsize bytes before the ETH
- * header, and the netpkt is the cookie of the buffer in the virtqueue:
+ * header, and the cookie of the buffer in the virtqueue leads to the netpkt:
  *
  * CONFIG_NET_LL_GUARDSIZE >= VIRTIO_NET_HDRSIZE + VIRTIO_NET_ETH_HDRSIZE
  *                          = 12 + 14 or (18 for VLAN)
@@ -224,6 +240,75 @@ static uint8_t g_netdev_num = 0;
  ****************************************************************************/
 
 /****************************************************************************
+ * Name: virtio_net_pkt_to_iov
+ *
+ * Description:
+ *   Get the buffers of a netpkt, with the virtio net header at the start of
+ *   the first one.
+ *
+ ****************************************************************************/
+
+static int virtio_net_pkt_to_iov(FAR struct virtio_net_priv_s *priv,
+                                 FAR netpkt_t *pkt, FAR struct iovec *iov)
+{
+  FAR struct netdev_lowerhalf_s *dev = (FAR struct netdev_lowerhalf_s *)priv;
+  int iov_cnt;
+
+  iov_cnt = netpkt_to_iov(dev, pkt, iov, VIRTIO_NET_MAX_NIOB);
+
+  iov[0].iov_base = (FAR uint8_t *)iov[0].iov_base - priv->hdrsize;
+  iov[0].iov_len += priv->hdrsize;
+  DEBUGASSERT((FAR uint8_t *)iov[0].iov_base >= netpkt_getbase(pkt));
+
+  return iov_cnt;
+}
+
+/****************************************************************************
+ * Name: virtio_net_release
+ *
+ * Description:
+ *   Take a netpkt back from a virtqueue: unmap its first iov_cnt buffers
+ *   (all of them if negative), of which the device has written len bytes,
+ *   and free the virtqueue buffer.
+ *
+ ****************************************************************************/
+
+static FAR netpkt_t *virtio_net_release(FAR struct virtio_net_priv_s *priv,
+                                        FAR struct virtio_net_buf_s *buf,
+                                        unsigned int vq_id, int iov_cnt,
+                                        size_t len)
+{
+  FAR netpkt_t *pkt = buf->pkt;
+  struct iovec iov[VIRTIO_NET_MAX_NIOB];
+  irqstate_t flags;
+  size_t n;
+  int ret;
+  int i;
+
+  ret = virtio_net_pkt_to_iov(priv, pkt, iov);
+  if (iov_cnt < 0)
+    {
+      iov_cnt = ret;
+    }
+
+  for (i = 0; i < iov_cnt; i++)
+    {
+      n = MIN(len, iov[i].iov_len);
+      virtio_unmap_buf(priv->vdev, iov[i].iov_base, n,
+                       vq_id == VIRTIO_NET_RX ? VIRTIO_DMA_FROM_DEVICE :
+                       VIRTIO_DMA_TO_DEVICE, buf->map[i]);
+      len -= n;
+    }
+
+  flags = spin_lock_irqsave(&priv->lock[vq_id]);
+  buf->flink = priv->freebufs[vq_id];
+  priv->freebufs[vq_id] = buf;
+  spin_unlock_irqrestore(&priv->lock[vq_id], flags);
+
+  return pkt;
+}
+
+/****************************************************************************
  * Name: virtio_net_addbuffer
  ****************************************************************************/
 
@@ -232,66 +317,95 @@ static int virtio_net_addbuffer(FAR struct netdev_lowerhalf_s *dev,
                                 unsigned int vq_id)
 {
   FAR struct virtio_net_priv_s *priv = (FAR struct virtio_net_priv_s *)dev;
-  FAR uint8_t *hdr;
+  FAR struct virtio_net_buf_s *buf;
   struct virtqueue_buf vb[VIRTIO_NET_MAX_NIOB + 1];
   struct iovec iov[VIRTIO_NET_MAX_NIOB];
+  irqstate_t flags;
   int iov_cnt;
+  int vb_cnt;
+  int ret;
   int i;
 
-  /* Convert netpkt to virtqueue_buf */
+  /* Convert netpkt to buffers, the first one starts with the net header */
 
-  iov_cnt = netpkt_to_iov(dev, pkt, iov, VIRTIO_NET_MAX_NIOB);
+  iov_cnt = virtio_net_pkt_to_iov(priv, pkt, iov);
+  memset(iov[0].iov_base, 0, priv->hdrsize);
 
-  /* Alloc net header from the link layer guard */
+  flags = spin_lock_irqsave(&priv->lock[vq_id]);
+  buf = priv->freebufs[vq_id];
+  if (buf != NULL)
+    {
+      priv->freebufs[vq_id] = buf->flink;
+    }
 
-  hdr = (FAR uint8_t *)iov[0].iov_base - priv->hdrsize;
-  DEBUGASSERT(hdr >= netpkt_getbase(pkt));
-  memset(hdr, 0, priv->hdrsize);
+  spin_unlock_irqrestore(&priv->lock[vq_id], flags);
+  if (buf == NULL)
+    {
+      return -ENOMEM;
+    }
+
+  buf->pkt = pkt;
+
+  /* Make the buffers accessible to the device */
+
+  for (i = 0; i < iov_cnt; i++)
+    {
+      ret = virtio_map_buf(priv->vdev, iov[i].iov_base, iov[i].iov_len,
+                           vq_id == VIRTIO_NET_RX ? VIRTIO_DMA_FROM_DEVICE :
+                           VIRTIO_DMA_TO_DEVICE, &buf->map[i]);
+      if (ret < 0)
+        {
+          virtio_net_release(priv, buf, vq_id, i, 0);
+          return ret;
+        }
+    }
 
   /* Prepare buffers depends on the feature VIRTIO_F_ANY_LAYOUT */
 
   if (virtio_has_feature(priv->vdev, VIRTIO_F_ANY_LAYOUT))
     {
-      /* Append the virtio net header to the first buffer */
+      /* The virtio net header is at the start of the first buffer */
 
-      vb[0].buf = hdr;
-      vb[0].len = iov[0].iov_len + priv->hdrsize;
-
-#if VIRTIO_NET_MAX_NIOB > 1
-      for (i = 1; i < iov_cnt; i++)
-        {
-          vb[i].buf = iov[i].iov_base;
-          vb[i].len = iov[i].iov_len;
-        }
-#endif
+      vb[0].buf = buf->map[0];
+      vb[0].len = iov[0].iov_len;
+      vb_cnt = 1;
     }
   else
     {
       /* Buffer 0 is only for virtio net header */
 
-      vb[0].buf = hdr;
+      vb[0].buf = buf->map[0];
       vb[0].len = priv->hdrsize;
-
-      for (i = 0; i < iov_cnt; i++)
-        {
-          vb[i + 1].buf = iov[i].iov_base;
-          vb[i + 1].len = iov[i].iov_len;
-        }
-
-      iov_cnt++;
+      vb[1].buf = (FAR uint8_t *)buf->map[0] + priv->hdrsize;
+      vb[1].len = iov[0].iov_len - priv->hdrsize;
+      vb_cnt = 2;
     }
 
-  vrtinfo("Fill vq=%u, pkt=%p, count=%d\n", vq_id, pkt, iov_cnt);
+  for (i = 1; i < iov_cnt; i++)
+    {
+      vb[vb_cnt].buf = buf->map[i];
+      vb[vb_cnt].len = iov[i].iov_len;
+      vb_cnt++;
+    }
+
+  vrtinfo("Fill vq=%u, pkt=%p, count=%d\n", vq_id, pkt, vb_cnt);
   if (vq_id == VIRTIO_NET_RX)
     {
-      return virtqueue_add_buffer_lock(vq, vb, 0, iov_cnt, pkt,
-                                       &priv->lock[vq_id]);
+      ret = virtqueue_add_buffer_lock(vq, vb, 0, vb_cnt, buf,
+                                      &priv->lock[vq_id]);
     }
   else
     {
-      return virtqueue_add_buffer_lock(vq, vb, iov_cnt, 0, pkt,
-                                       &priv->lock[vq_id]);
+      ret = virtqueue_add_buffer_lock(vq, vb, vb_cnt, 0, buf,
+                                      &priv->lock[vq_id]);
     }
+
+  if (ret < 0)
+    {
+      virtio_net_release(priv, buf, vq_id, iov_cnt, 0);
+    }
+
+  return ret;
 }
 
 /****************************************************************************
@@ -350,19 +464,21 @@ static void virtio_net_txfree(FAR struct netdev_lowerhalf_s *dev)
 {
   FAR struct virtio_net_priv_s *priv = (FAR struct virtio_net_priv_s *)dev;
   FAR struct virtqueue *vq = priv->vdev->vrings_info[VIRTIO_NET_TX].vq;
+  FAR struct virtio_net_buf_s *buf;
   FAR netpkt_t *pkt;
 
   while (1)
     {
       /* Get buffer from tx virtqueue */
 
-      pkt = virtqueue_get_buffer_lock(vq, NULL, NULL,
+      buf = virtqueue_get_buffer_lock(vq, NULL, NULL,
                                       &priv->lock[VIRTIO_NET_TX]);
-      if (pkt == NULL)
+      if (buf == NULL)
         {
           break;
         }
 
+      pkt = virtio_net_release(priv, buf, VIRTIO_NET_TX, -1, 0);
       vrtinfo("Free, pkt: %p\n", pkt);
       netpkt_free(dev, pkt, NETPKT_TX);
     }
@@ -389,9 +505,9 @@ static void virtio_net_free_vq_buffers(FAR struct virtio_device *vdev)
 {
   FAR struct virtio_net_priv_s *priv = vdev->priv;
   FAR struct netdev_lowerhalf_s *dev = (FAR struct netdev_lowerhalf_s *)priv;
+  FAR struct virtio_net_buf_s *buf;
   FAR struct virtqueue *vq;
   FAR netpkt_t *pkt;
-  FAR void *buf;
   enum netpkt_type_e type;
   uint16_t idx;
   int i;
@@ -403,13 +519,14 @@ static void virtio_net_free_vq_buffers(FAR struct virtio_device *vdev)
 
       while (1)
         {
-          pkt = virtqueue_get_buffer_lock(vq, NULL, NULL,
+          buf = virtqueue_get_buffer_lock(vq, NULL, NULL,
                                            &priv->lock[i]);
-          if (pkt == NULL)
+          if (buf == NULL)
             {
               break;
             }
 
+          pkt = virtio_net_release(priv, buf, i, -1, 0);
           netpkt_free(dev, pkt, type);
         }
 
@@ -419,16 +536,16 @@ static void virtio_net_free_vq_buffers(FAR struct virtio_device *vdev)
 
       while (1)
         {
-          buf = virtqueue_get_available_buffer_lock(vq, &idx, NULL,
-                                                    &priv->lock[i]);
-          if (buf == NULL)
+          if (virtqueue_get_available_buffer_lock(vq, &idx, NULL,
+                                                  &priv->lock[i]) == NULL)
             {
               break;
             }
 
-          /* The netpkt is the cookie of the head descriptor */
+          /* The buffer is the cookie of the head descriptor */
 
-          pkt = vq->vq_descx[idx].cookie;
+          buf = vq->vq_descx[idx].cookie;
+          pkt = virtio_net_release(priv, buf, i, -1, 0);
           netpkt_free(dev, pkt, type);
         }
     }
@@ -479,6 +596,7 @@ static int virtio_net_ifdown(FAR struct netdev_lowerhalf_s *dev)
 {
   FAR struct virtio_net_priv_s *priv = (FAR struct virtio_net_priv_s *)dev;
   FAR struct virtqueue *vq = priv->vdev->vrings_info[VIRTIO_NET_RX].vq;
+  FAR struct virtio_net_buf_s *buf;
   FAR netpkt_t *pkt;
   int i;
 
@@ -496,13 +614,14 @@ static int virtio_net_ifdown(FAR struct netdev_lowerhalf_s *dev)
 
   while (1)
     {
-      pkt = virtqueue_get_buffer_lock(vq, NULL, NULL,
+      buf = virtqueue_get_buffer_lock(vq, NULL, NULL,
                                       &priv->lock[VIRTIO_NET_RX]);
-      if (pkt == NULL)
+      if (buf == NULL)
         {
           break;
         }
 
+      pkt = virtio_net_release(priv, buf, VIRTIO_NET_RX, -1, 0);
       netpkt_free(dev, pkt, NETPKT_RX);
     }
 
@@ -583,6 +702,7 @@ static netpkt_t *virtio_net_recv(FAR struct netdev_lowerhalf_s *dev)
 {
   FAR struct virtio_net_priv_s *priv = (FAR struct virtio_net_priv_s *)dev;
   FAR struct virtqueue *vq = priv->vdev->vrings_info[VIRTIO_NET_RX].vq;
+  FAR struct virtio_net_buf_s *buf;
   FAR netpkt_t *pkt;
   irqstate_t flags;
   uint32_t len;
@@ -594,8 +714,8 @@ static netpkt_t *virtio_net_recv(FAR struct netdev_lowerhalf_s *dev)
   /* Get received buffer form RX virtqueue */
 
   flags = spin_lock_irqsave(&priv->lock[VIRTIO_NET_RX]);
-  pkt = virtqueue_get_buffer(vq, &len, NULL);
-  if (pkt == NULL)
+  buf = virtqueue_get_buffer(vq, &len, NULL);
+  if (buf == NULL)
     {
       /* If we have no buffer left, enable RX callback. */
 
@@ -604,20 +724,21 @@ static netpkt_t *virtio_net_recv(FAR struct netdev_lowerhalf_s *dev)
           /* A buffer was received before the callback was enabled */
 
           virtqueue_disable_cb(vq);
-          pkt = virtqueue_get_buffer(vq, &len, NULL);
+          buf = virtqueue_get_buffer(vq, &len, NULL);
         }
     }
 
   spin_unlock_irqrestore(&priv->lock[VIRTIO_NET_RX], flags);
 
-  if (pkt == NULL)
+  if (buf == NULL)
     {
       vrtinfo("get NULL buffer\n");
       return NULL;
     }
 
-  /* Set the received pkt length */
+  /* Get what the device wrote and set the received pkt length */
 
+  pkt = virtio_net_release(priv, buf, VIRTIO_NET_RX, -1, len);
   netpkt_setdatalen(dev, pkt, len - priv->hdrsize);
   vrtinfo("Recv, pkt=%p, len=%" PRIu32 "\n", pkt, len);
   return pkt;
@@ -692,6 +813,7 @@ static int virtio_net_init(FAR struct virtio_net_priv_s *priv,
   FAR const char *vqnames[VIRTIO_NET_NUM];
   vq_callback callbacks[VIRTIO_NET_NUM];
   int ret;
+  int i;
 
   spin_lock_init(&priv->lock[VIRTIO_NET_RX]);
   spin_lock_init(&priv->lock[VIRTIO_NET_TX]);
@@ -735,6 +857,25 @@ static int virtio_net_init(FAR struct virtio_net_priv_s *priv,
                      (VIRTIO_NET_MAX_NIOB + 1), priv->bufnum);
   priv->bufnum = MIN(vdev->vrings_info[VIRTIO_NET_TX].info.num_descs /
                      (VIRTIO_NET_MAX_NIOB + 1), priv->bufnum);
+
+  /* Each virtqueue holds up to bufnum netpkts */
+
+  priv->bufs = kmm_zalloc(VIRTIO_NET_NUM * priv->bufnum *
+                          sizeof(struct virtio_net_buf_s));
+  if (priv->bufs == NULL)
+    {
+      vrterr("No memory for the virtqueue buffers\n");
+      virtio_reset_device(vdev);
+      virtio_delete_virtqueues(vdev);
+      return -ENOMEM;
+    }
+
+  for (i = 0; i < VIRTIO_NET_NUM * priv->bufnum; i++)
+    {
+      priv->bufs[i].flink = priv->freebufs[i % VIRTIO_NET_NUM];
+      priv->freebufs[i % VIRTIO_NET_NUM] = &priv->bufs[i];
+    }
+
   return OK;
 }
 
@@ -839,6 +980,7 @@ err_with_virtqueues:
   virtio_reset_device(vdev);
   virtio_delete_virtqueues(vdev);
 err_with_priv:
+  kmm_free(priv->bufs);
   kmm_free(priv);
   return ret;
 }
@@ -859,6 +1001,7 @@ static void virtio_net_remove(FAR struct virtio_device *vdev)
   g_netdev_num--;
   wifi_sim_remove(&priv->lower);
 #endif
+  kmm_free(priv->bufs);
   kmm_free(priv);
 }
 
